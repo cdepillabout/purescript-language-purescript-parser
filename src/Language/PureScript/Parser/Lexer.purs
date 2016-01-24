@@ -3,10 +3,26 @@ module Language.PureScript.Parser.Lexer where
 
 import Prelude
 
+import Control.Alt
+import Control.Apply
+import Control.MonadPlus
+import Control.Plus
+import Data.Array as Array
+import Data.Char.Unicode
 import Data.Either
-import Text.Parsing.Parser.Pos (Position)
+import Data.Foldable
+import Data.Functor
+import Data.Identity
+import Data.List as List
+import Data.String
+import Text.Parsing.Parser as P
+import Text.Parsing.Parser.Combinators as P
+import Text.Parsing.Parser.Pos as P
+import Text.Parsing.Parser.String as P
+import Text.Parsing.Parser.Token as PT
 
 import Language.PureScript.Comments
+import Language.PureScript.Parser.State
 
 data Token
   = LParen
@@ -70,7 +86,7 @@ prettyPrintToken (StringLiteral s) = show s
 prettyPrintToken (NumberToken n)        = either show show n
 
 newtype PositionedToken = PositionedToken
-  { ptSourcePos :: Position
+  { ptSourcePos :: P.Position
   , ptToken     :: Token
   , ptComments  :: Array Comment
   }
@@ -80,129 +96,137 @@ newtype PositionedToken = PositionedToken
 -- instance Show PositionedToken where
 --   show = prettyPrintToken . ptToken
 
--- lex :: FilePath -> String -> Either P.ParseError [PositionedToken]
--- lex = P.parse parseTokens
+lex :: String -> Either P.ParseError (Array PositionedToken)
+lex s = P.runParser s parseTokens
 
--- parseTokens :: P.Parsec String u [PositionedToken]
--- parseTokens = whitespace *> P.many parsePositionedToken <* P.skipMany parseComment <* P.eof
+parseTokens :: P.Parser String (Array PositionedToken)
+parseTokens = whitespace *> Array.many parsePositionedToken <* P.skipMany parseComment <* P.eof
 
--- whitespace :: P.Parsec String u ()
--- whitespace = P.skipMany (P.satisfy isSpace)
+whitespace :: P.Parser String Unit
+whitespace = P.skipMany (P.satisfy isSpace)
 
--- parseComment :: P.Parsec String u Comment
--- parseComment = (BlockComment <$> blockComment <|> LineComment <$> lineComment) <* whitespace
---   where
---   blockComment :: P.Parsec String u String
---   blockComment = P.try $ P.string "{-" *> P.manyTill P.anyChar (P.try (P.string "-}"))
+parseComment :: P.Parser String Comment
+parseComment = (BlockComment <$> blockComment <|> LineComment <$> lineComment) <* whitespace
+  where
+    blockComment :: P.Parser String String
+    blockComment = P.try $ P.string "{-" *> manyTillString (P.try (P.string "-}"))
 
---   lineComment :: P.Parsec String u String
---   lineComment = P.try $ P.string "--" *> P.manyTill P.anyChar (P.try (void (P.char '\n') <|> P.eof))
+    lineComment :: P.Parser String String
+    lineComment = P.try $ P.string "--" *> manyTillString (P.try (void (P.char '\n') <|> P.eof))
 
--- parsePositionedToken :: P.Parsec String u PositionedToken
--- parsePositionedToken = P.try $ do
---   comments <- P.many parseComment
---   pos <- P.getPosition
---   tok <- parseToken
---   return $ PositionedToken pos tok comments
+parsePositionedToken :: P.Parser String PositionedToken
+parsePositionedToken = P.try do
+  comments <- Array.many parseComment
+  pos <- getPosition
+  tok <- parseToken
+  return $ PositionedToken { ptSourcePos: pos, ptToken: tok, ptComments: comments }
 
--- parseToken :: P.Parsec String u Token
--- parseToken = P.choice
---   [ P.try $ P.string "<-" *> P.notFollowedBy symbolChar *> pure LArrow
---   , P.try $ P.string "<=" *> P.notFollowedBy symbolChar *> pure LFatArrow
---   , P.try $ P.string "->" *> P.notFollowedBy symbolChar *> pure RArrow
---   , P.try $ P.string "=>" *> P.notFollowedBy symbolChar *> pure RFatArrow
---   , P.try $ P.string "::" *> P.notFollowedBy symbolChar *> pure DoubleColon
---   , P.try $ P.char '('    *> pure LParen
---   , P.try $ P.char ')'    *> pure RParen
---   , P.try $ P.char '{'    *> pure LBrace
---   , P.try $ P.char '}'    *> pure RBrace
---   , P.try $ P.char '['    *> pure LSquare
---   , P.try $ P.char ']'    *> pure RSquare
---   , P.try $ P.char '`'    *> pure Tick
---   , P.try $ P.char ','    *> pure Comma
---   , P.try $ P.char '='    *> P.notFollowedBy symbolChar *> pure Equals
---   , P.try $ P.char ':'    *> P.notFollowedBy symbolChar *> pure Colon
---   , P.try $ P.char '|'    *> P.notFollowedBy symbolChar *> pure Pipe
---   , P.try $ P.char '.'    *> P.notFollowedBy symbolChar *> pure Dot
---   , P.try $ P.char ';'    *> P.notFollowedBy symbolChar *> pure Semi
---   , P.try $ P.char '@'    *> P.notFollowedBy symbolChar *> pure At
---   , P.try $ P.char '_'    *> P.notFollowedBy identLetter *> pure Underscore
---   , LName         <$> parseLName
---   , do uName <- parseUName
---        (guard (validModuleName uName) >> Qualifier uName <$ P.char '.') <|> pure (UName uName)
---   , Symbol        <$> parseSymbol
+parseToken :: P.Parser String Token
+parseToken = P.choice
+    [ P.try $ P.string "<-" *> P.notFollowedBy symbolChar *> pure LArrow
+    , P.try $ P.string "<=" *> P.notFollowedBy symbolChar *> pure LFatArrow
+    , P.try $ P.string "->" *> P.notFollowedBy symbolChar *> pure RArrow
+    , P.try $ P.string "=>" *> P.notFollowedBy symbolChar *> pure RFatArrow
+    , P.try $ P.string "::" *> P.notFollowedBy symbolChar *> pure DoubleColon
+    , P.try $ P.char '('    *> pure LParen
+    , P.try $ P.char ')'    *> pure RParen
+    , P.try $ P.char '{'    *> pure LBrace
+    , P.try $ P.char '}'    *> pure RBrace
+    , P.try $ P.char '['    *> pure LSquare
+    , P.try $ P.char ']'    *> pure RSquare
+    , P.try $ P.char '`'    *> pure Tick
+    , P.try $ P.char ','    *> pure Comma
+    , P.try $ P.char '='    *> P.notFollowedBy symbolChar *> pure Equals
+    , P.try $ P.char ':'    *> P.notFollowedBy symbolChar *> pure Colon
+    , P.try $ P.char '|'    *> P.notFollowedBy symbolChar *> pure Pipe
+    , P.try $ P.char '.'    *> P.notFollowedBy symbolChar *> pure Dot
+    , P.try $ P.char ';'    *> P.notFollowedBy symbolChar *> pure Semi
+    , P.try $ P.char '@'    *> P.notFollowedBy symbolChar *> pure At
+    , P.try $ P.char '_'    *> P.notFollowedBy identLetter *> pure Underscore
+    , LName         <$> parseLName
+    , do
+        uName <- parseUName
+        let guard' = guard (validModuleName uName) *> (Qualifier uName <$ P.char '.')
+        guard' <|> pure (UName uName)
+    , Symbol        <$> parseSymbol
 --   , CharLiteral   <$> parseCharLiteral
 --   , StringLiteral <$> parseStringLiteral
 --   , NumberToken   <$> parseNumber
---   ] <* whitespace
+  ] <* whitespace
 
---   where
---   parseLName :: P.Parsec String u String
---   parseLName = (:) <$> identStart <*> P.many identLetter
+  where
+    parseLName :: P.Parser String String
+    parseLName = map fromCharArray $ Array.cons <$> identStart <*> Array.many identLetter
 
---   parseUName :: P.Parsec String u String
---   parseUName = (:) <$> P.upper <*> P.many uidentLetter
+    parseUName :: P.Parser String String
+    parseUName = map fromCharArray $ Array.cons <$> upper <*> Array.many uidentLetter
 
---   parseSymbol :: P.Parsec String u String
---   parseSymbol = P.many1 symbolChar
+    parseSymbol :: P.Parser String String
+    parseSymbol = fromCharArray <$> Array.some symbolChar
 
---   identStart :: P.Parsec String u Char
---   identStart = P.lower <|> P.oneOf "_"
+    identStart :: P.Parser String Char
+    identStart = lower <|> P.char '_'
 
---   identLetter :: P.Parsec String u Char
---   identLetter = P.alphaNum <|> P.oneOf "_'"
+    identLetter :: P.Parser String Char
+    identLetter = alphaNum <|> P.oneOf ['_', '\'']
 
---   uidentLetter :: P.Parsec String u Char
---   uidentLetter = P.alphaNum <|> P.char '_'
+    uidentLetter :: P.Parser String Char
+    uidentLetter = alphaNum <|> P.char '_'
 
---   symbolChar :: P.Parsec String u Char
---   symbolChar = P.satisfy isSymbolChar
+    symbolChar :: P.Parser String Char
+    symbolChar = P.satisfy isSymbolChar
 
---   parseCharLiteral :: P.Parsec String u Char
---   parseCharLiteral = PT.charLiteral tokenParser
+    parseCharLiteral :: P.Parser String Char
+    parseCharLiteral = tokenParser.charLiteral
 
---   parseStringLiteral :: P.Parsec String u String
---   parseStringLiteral = blockString <|> PT.stringLiteral tokenParser
---     where
---     delimiter   = P.try (P.string "\"\"\"")
---     blockString = delimiter >> P.manyTill P.anyChar delimiter
+    parseStringLiteral :: P.Parser String String
+    parseStringLiteral = blockString <|> tokenParser.stringLiteral
+      where
+        delimiter :: P.Parser String String
+        delimiter   = P.try (P.string "\"\"\"")
 
---   parseNumber :: P.Parsec String u (Either Integer Double)
---   parseNumber = (consumeLeadingZero >> P.parserZero) <|>
---                   (Right <$> P.try (PT.float tokenParser) <|>
---                   Left <$> P.try (PT.natural tokenParser))
---                 P.<?> "number"
---     where
---     -- lookAhead doesn't consume any input if its parser succeeds
---     -- if notFollowedBy fails though, the consumed '0' will break the choice chain
---     consumeLeadingZero = P.lookAhead (P.char '0' >>
---       (P.notFollowedBy P.digit P.<?> "no leading zero in number literal"))
+        blockString :: P.Parser String String
+        blockString = delimiter *> manyTillString delimiter
 
--- -- |
--- -- We use Text.Parsec.Token to implement the string and number lexemes
--- --
--- langDef :: PT.GenLanguageDef String u Identity
--- langDef = PT.LanguageDef
---   { PT.reservedNames   = []
---   , PT.reservedOpNames = []
---   , PT.commentStart    = ""
---   , PT.commentEnd      = ""
---   , PT.commentLine     = ""
---   , PT.nestedComments  = True
---   , PT.identStart      = fail "Identifiers not supported"
---   , PT.identLetter     = fail "Identifiers not supported"
---   , PT.opStart         = fail "Operators not supported"
---   , PT.opLetter        = fail "Operators not supported"
---   , PT.caseSensitive   = True
---   }
+    parseNumber :: P.Parser String (Either Int Number)
+    parseNumber = ( consumeLeadingZero *> empty )
+              <|> ( Right <$> P.try tokenParser.float <|> Left <$> P.try tokenParser.natural )
+              P.<?> "number"
+      where
+        -- lookAhead doesn't consume any input if its parser succeeds
+        -- if notFollowedBy fails though, the consumed '0' will break the choice chain
+        consumeLeadingZero = P.lookAhead
+            ( P.char '0' *> ( P.notFollowedBy PT.digit P.<?> "no leading zero in number literal" ) )
 
--- -- |
--- -- A token parser based on the language definition
--- --
--- tokenParser :: PT.GenTokenParser String u Identity
--- tokenParser = PT.makeTokenParser langDef
+-- |
+-- We use Text.Parsec.Token to implement the string and number lexemes
+--
+langDef :: PT.GenLanguageDef String Identity
+langDef = PT.LanguageDef
+  { reservedNames:    []
+  , reservedOpNames:  []
+  , commentStart:     ""
+  , commentEnd:       ""
+  , commentLine:      ""
+  , nestedComments:   true
+  , identStart:       P.fail "Identifiers not supported"
+  , identLetter:      P.fail "Identifiers not supported"
+  , opStart:          P.fail "Operators not supported"
+  , opLetter:         P.fail "Operators not supported"
+  , caseSensitive:    true
+  }
 
--- type TokenParser a = P.Parsec [PositionedToken] ParseState a
+-- |
+-- A token parser based on the language definition
+--
+tokenParser :: PT.GenTokenParser String Identity
+tokenParser = PT.makeTokenParser langDef
+
+newtype ParseStateWrapper = ParseStateWrapper { parseState :: ParseState
+                                              , tokens :: Array PositionedToken
+                                              }
+
+type TokenParser a = P.Parser ParseStateWrapper a
 
 -- anyToken :: TokenParser PositionedToken
 -- anyToken = P.token (prettyPrintToken . ptToken) ptSourcePos Just
@@ -210,31 +234,31 @@ newtype PositionedToken = PositionedToken
 -- token :: (Token -> Maybe a) -> TokenParser a
 -- token f = P.token (prettyPrintToken . ptToken) ptSourcePos (f . ptToken)
 
--- match :: Token -> TokenParser ()
--- match tok = token (\tok' -> if tok == tok' then Just () else Nothing) P.<?> prettyPrintToken tok
+-- match :: Token -> TokenParser Unit
+-- match tok = token (\tok' -> if tok == tok' then Just unit else Nothing) <?> prettyPrintToken tok
 
--- lparen :: TokenParser ()
+-- lparen :: TokenParser Unit
 -- lparen = match LParen
 
--- rparen :: TokenParser ()
+-- rparen :: TokenParser Unit
 -- rparen = match RParen
 
 -- parens :: TokenParser a -> TokenParser a
 -- parens = P.between lparen rparen
 
--- lbrace :: TokenParser ()
+-- lbrace :: TokenParser Unit
 -- lbrace = match LBrace
 
--- rbrace :: TokenParser ()
+-- rbrace :: TokenParser Unit
 -- rbrace = match RBrace
 
 -- braces :: TokenParser a -> TokenParser a
 -- braces = P.between lbrace rbrace
 
--- lsquare :: TokenParser ()
+-- lsquare :: TokenParser Unit
 -- lsquare = match LSquare
 
--- rsquare :: TokenParser ()
+-- rsquare :: TokenParser Unit
 -- rsquare = match RSquare
 
 -- squares :: TokenParser a -> TokenParser a
@@ -246,52 +270,52 @@ newtype PositionedToken = PositionedToken
 --   go (Indent n) = Just n
 --   go _ = Nothing
 
--- indentAt :: P.Column -> TokenParser ()
+-- indentAt :: P.Column -> TokenParser Unit
 -- indentAt n = token go P.<?> "indentation at level " ++ show n
 --   where
---   go (Indent n') | n == n' = Just ()
+--   go (Indent n') | n == n' = Just unit
 --   go _ = Nothing
 
--- larrow :: TokenParser ()
+-- larrow :: TokenParser Unit
 -- larrow = match LArrow
 
--- rarrow :: TokenParser ()
+-- rarrow :: TokenParser Unit
 -- rarrow = match RArrow
 
--- lfatArrow :: TokenParser ()
+-- lfatArrow :: TokenParser Unit
 -- lfatArrow = match LFatArrow
 
--- rfatArrow :: TokenParser ()
+-- rfatArrow :: TokenParser Unit
 -- rfatArrow = match RFatArrow
 
--- colon :: TokenParser ()
+-- colon :: TokenParser Unit
 -- colon = match Colon
 
--- doubleColon :: TokenParser ()
+-- doubleColon :: TokenParser Unit
 -- doubleColon = match DoubleColon
 
--- equals :: TokenParser ()
+-- equals :: TokenParser Unit
 -- equals = match Equals
 
--- pipe :: TokenParser ()
+-- pipe :: TokenParser Unit
 -- pipe = match Pipe
 
--- tick :: TokenParser ()
+-- tick :: TokenParser Unit
 -- tick = match Tick
 
--- dot :: TokenParser ()
+-- dot :: TokenParser Unit
 -- dot = match Dot
 
--- comma :: TokenParser ()
+-- comma :: TokenParser Unit
 -- comma = match Comma
 
--- semi :: TokenParser ()
+-- semi :: TokenParser Unit
 -- semi = match Semi
 
--- at :: TokenParser ()
+-- at :: TokenParser Unit
 -- at = match At
 
--- underscore :: TokenParser ()
+-- underscore :: TokenParser Unit
 -- underscore = match Underscore
 
 -- -- |
@@ -330,10 +354,10 @@ newtype PositionedToken = PositionedToken
 --   go (Qualifier s) = Just s
 --   go _ = Nothing
 
--- reserved :: String -> TokenParser ()
+-- reserved :: String -> TokenParser Unit
 -- reserved s = token go P.<?> show s
 --   where
---   go (LName s') | s == s' = Just ()
+--   go (LName s') | s == s' = Just unit
 --   go _ = Nothing
 
 -- uname :: TokenParser String
@@ -348,10 +372,10 @@ newtype PositionedToken = PositionedToken
 --   go (UName s) | validModuleName s = Just s
 --   go _ = Nothing
 
--- uname' :: String -> TokenParser ()
+-- uname' :: String -> TokenParser Unit
 -- uname' s = token go P.<?> show s
 --   where
---   go (UName s') | s == s' = Just ()
+--   go (UName s') | s == s' = Just unit
 --   go _ = Nothing
 
 -- symbol :: TokenParser String
@@ -363,12 +387,12 @@ newtype PositionedToken = PositionedToken
 --   go At         = Just "@"
 --   go _ = Nothing
 
--- symbol' :: String -> TokenParser ()
+-- symbol' :: String -> TokenParser Unit
 -- symbol' s = token go P.<?> show s
 --   where
---   go (Symbol s') | s == s'   = Just ()
---   go Colon       | s == ":"  = Just ()
---   go LFatArrow   | s == "<=" = Just ()
+--   go (Symbol s') | s == s'   = Just unit
+--   go Colon       | s == ":"  = Just unit
+--   go LFatArrow   | s == "<=" = Just unit
 --   go _ = Nothing
 
 -- charLiteral :: TokenParser Char
@@ -401,43 +425,59 @@ newtype PositionedToken = PositionedToken
 --   go (LName s) | s `notElem` reservedPsNames = Just s
 --   go _ = Nothing
 
--- validModuleName :: String -> Bool
--- validModuleName s = '_' `notElem` s
+validModuleName :: String -> Boolean
+validModuleName s = not $ "_" `contains` s
 
--- -- |
--- -- A list of purescript reserved identifiers
--- --
--- reservedPsNames :: [String]
--- reservedPsNames = [ "data"
---                   , "newtype"
---                   , "type"
---                   , "foreign"
---                   , "import"
---                   , "infixl"
---                   , "infixr"
---                   , "infix"
---                   , "class"
---                   , "instance"
---                   , "derive"
---                   , "module"
---                   , "case"
---                   , "of"
---                   , "if"
---                   , "then"
---                   , "else"
---                   , "do"
---                   , "let"
---                   , "true"
---                   , "false"
---                   , "in"
---                   , "where"
---                   ]
+-- | A list of purescript reserved identifiers
+reservedPsNames :: Array String
+reservedPsNames = [ "data"
+                  , "newtype"
+                  , "type"
+                  , "foreign"
+                  , "import"
+                  , "infixl"
+                  , "infixr"
+                  , "infix"
+                  , "class"
+                  , "instance"
+                  , "derive"
+                  , "module"
+                  , "case"
+                  , "of"
+                  , "if"
+                  , "then"
+                  , "else"
+                  , "do"
+                  , "let"
+                  , "true"
+                  , "false"
+                  , "in"
+                  , "where"
+                  ]
 
--- reservedTypeNames :: [String]
--- reservedTypeNames = [ "forall", "where" ]
+reservedTypeNames :: Array String
+reservedTypeNames = [ "forall", "where" ]
 
--- -- |
--- -- The characters allowed for use in operators
--- --
--- isSymbolChar :: Char -> Bool
--- isSymbolChar c = (c `elem` ":!#$%&*+./<=>?@\\^|-~") || (not (isAscii c) && isSymbol c)
+manyTillString :: forall a . P.Parser String a -> P.Parser String String
+manyTillString p = fromCharArray <<< List.toUnfoldable <$> P.manyTill P.anyChar p
+
+lower :: P.Parser String Char
+lower = P.satisfy isLower
+
+upper :: P.Parser String Char
+upper = P.satisfy isUpper
+
+alphaNum :: P.Parser String Char
+alphaNum = P.satisfy isAlphaNum
+
+-- |
+-- The characters allowed for use in operators
+--
+isSymbolChar :: Char -> Boolean
+isSymbolChar c =
+    let chars = [':', '!', '#', '$', '%', '&', '*', '+', '.', '/', '<', '=', '>', '?', '@', '\\', '^', '|', '-', '~']
+    in (c `elem` chars) || (not (isAscii c) && isSymbol c)
+
+getPosition :: forall s m . (Applicative m) => P.ParserT s m P.Position
+getPosition = P.ParserT \(P.PState { input: s, position: pos }) ->
+    pure { input: s, result: Right pos, consumed: false, position: pos }
