@@ -12,8 +12,10 @@ import Data.Char.Unicode
 import Data.Either
 import Data.Foldable
 import Data.Functor
+import Data.Generic
 import Data.Identity
 import Data.List as List
+import Data.Maybe
 import Data.String
 import Text.Parsing.Parser as P
 import Text.Parsing.Parser.Combinators as P
@@ -53,7 +55,10 @@ data Token
   | CharLiteral Char
   | StringLiteral String
   | NumberToken (Either Int Number)
--- deriving (Show, Read, Eq, Ord)
+
+derive instance genericToken :: Generic Token
+instance showToken :: Show Token where show = gShow
+instance eqToken :: Eq Token where eq = gEq
 
 prettyPrintToken :: Token -> String
 prettyPrintToken LParen            = "("
@@ -90,11 +95,15 @@ newtype PositionedToken = PositionedToken
   , ptToken     :: Token
   , ptComments  :: Array Comment
   }
--- deriving (Eq)
+instance showPositionedToken :: Show PositionedToken where
+    show (PositionedToken posTok) = "PositionedToken { ptSourcePos = " <> show posTok.ptSourcePos <>
+                                                   " , ptToken = " <> prettyPrintToken posTok.ptToken <>
+                                                   " , ptComments = " <> show posTok.ptComments <>
+                                                   " }"
 
--- -- Parsec requires this instance for various token-level combinators
--- instance Show PositionedToken where
---   show = prettyPrintToken . ptToken
+
+unPositionedToken :: PositionedToken -> { ptSourcePos :: P.Position, ptToken :: Token, ptComments :: Array Comment }
+unPositionedToken (PositionedToken posTok) = posTok
 
 lex :: String -> Either P.ParseError (Array PositionedToken)
 lex s = P.runParser s parseTokens
@@ -149,9 +158,9 @@ parseToken = P.choice
         let guard' = guard (validModuleName uName) *> (Qualifier uName <$ P.char '.')
         guard' <|> pure (UName uName)
     , Symbol        <$> parseSymbol
---   , CharLiteral   <$> parseCharLiteral
---   , StringLiteral <$> parseStringLiteral
---   , NumberToken   <$> parseNumber
+    , CharLiteral   <$> parseCharLiteral
+    , StringLiteral <$> parseStringLiteral
+    , NumberToken   <$> parseNumber
   ] <* whitespace
 
   where
@@ -223,207 +232,222 @@ tokenParser :: PT.GenTokenParser String Identity
 tokenParser = PT.makeTokenParser langDef
 
 newtype ParseStateWrapper = ParseStateWrapper { parseState :: ParseState
-                                              , tokens :: Array PositionedToken
+                                              , tokens :: List.List PositionedToken
                                               }
 
 type TokenParser a = P.Parser ParseStateWrapper a
 
--- anyToken :: TokenParser PositionedToken
--- anyToken = P.token (prettyPrintToken . ptToken) ptSourcePos Just
+anyToken :: TokenParser PositionedToken
+anyToken =
+    token' (\(PositionedToken posTok) -> posTok.ptSourcePos)
+           (\(ParseStateWrapper wrapper) -> wrapper.tokens)
+           (\(ParseStateWrapper wrapper) tokens -> ParseStateWrapper wrapper { tokens = tokens })
 
--- token :: (Token -> Maybe a) -> TokenParser a
--- token f = P.token (prettyPrintToken . ptToken) ptSourcePos (f . ptToken)
+token :: forall a . (Token -> Maybe a) -> TokenParser a
+token f = do
+    posTok <- anyToken
+    case f <<< _.ptToken $ unPositionedToken posTok of
+         Nothing -> P.fail $ "unexpected error: " <> show posTok
+         Just a -> pure a
 
--- match :: Token -> TokenParser Unit
--- match tok = token (\tok' -> if tok == tok' then Just unit else Nothing) <?> prettyPrintToken tok
 
--- lparen :: TokenParser Unit
--- lparen = match LParen
+-- | Create a parser which returns the first token in the stream.
+token' :: forall m a s . (Monad m) => (a -> P.Position) -> (s -> List.List a) -> (s -> List.List a -> s) -> P.ParserT s m a
+token' tokpos getTokList createNewS = P.ParserT $ \(P.PState { input: toks, position: pos }) ->
+  pure $ case getTokList toks of
+    List.Cons x xs -> { consumed: true, input: createNewS toks xs, result: Right x, position: tokpos x }
+    _ -> P.parseFailed toks pos "expected token, met EOF"
 
--- rparen :: TokenParser Unit
--- rparen = match RParen
+match :: Token -> TokenParser Unit
+match tok = token (\tok' -> if tok == tok' then Just unit else Nothing) P.<?> prettyPrintToken tok
 
--- parens :: TokenParser a -> TokenParser a
--- parens = P.between lparen rparen
+lparen :: TokenParser Unit
+lparen = match LParen
 
--- lbrace :: TokenParser Unit
--- lbrace = match LBrace
+rparen :: TokenParser Unit
+rparen = match RParen
 
--- rbrace :: TokenParser Unit
--- rbrace = match RBrace
+parens :: forall a . TokenParser a -> TokenParser a
+parens = P.between lparen rparen
 
--- braces :: TokenParser a -> TokenParser a
--- braces = P.between lbrace rbrace
+lbrace :: TokenParser Unit
+lbrace = match LBrace
 
--- lsquare :: TokenParser Unit
--- lsquare = match LSquare
+rbrace :: TokenParser Unit
+rbrace = match RBrace
 
--- rsquare :: TokenParser Unit
--- rsquare = match RSquare
+braces :: forall a . TokenParser a -> TokenParser a
+braces = P.between lbrace rbrace
 
--- squares :: TokenParser a -> TokenParser a
--- squares = P.between lsquare rsquare
+lsquare :: TokenParser Unit
+lsquare = match LSquare
 
--- indent :: TokenParser Int
--- indent = token go P.<?> "indentation"
---   where
---   go (Indent n) = Just n
---   go _ = Nothing
+rsquare :: TokenParser Unit
+rsquare = match RSquare
 
--- indentAt :: P.Column -> TokenParser Unit
--- indentAt n = token go P.<?> "indentation at level " ++ show n
---   where
---   go (Indent n') | n == n' = Just unit
---   go _ = Nothing
+squares :: forall a . TokenParser a -> TokenParser a
+squares = P.between lsquare rsquare
 
--- larrow :: TokenParser Unit
--- larrow = match LArrow
+indent :: TokenParser Int
+indent = token go P.<?> "indentation"
+  where
+  go (Indent n) = Just n
+  go _ = Nothing
 
--- rarrow :: TokenParser Unit
--- rarrow = match RArrow
+indentAt :: Int -> TokenParser Unit
+indentAt n = token go P.<?> "indentation at level " <> show n
+  where
+  go (Indent n') | n == n' = Just unit
+  go _ = Nothing
 
--- lfatArrow :: TokenParser Unit
--- lfatArrow = match LFatArrow
+larrow :: TokenParser Unit
+larrow = match LArrow
 
--- rfatArrow :: TokenParser Unit
--- rfatArrow = match RFatArrow
+rarrow :: TokenParser Unit
+rarrow = match RArrow
 
--- colon :: TokenParser Unit
--- colon = match Colon
+lfatArrow :: TokenParser Unit
+lfatArrow = match LFatArrow
 
--- doubleColon :: TokenParser Unit
--- doubleColon = match DoubleColon
+rfatArrow :: TokenParser Unit
+rfatArrow = match RFatArrow
 
--- equals :: TokenParser Unit
--- equals = match Equals
+colon :: TokenParser Unit
+colon = match Colon
 
--- pipe :: TokenParser Unit
--- pipe = match Pipe
+doubleColon :: TokenParser Unit
+doubleColon = match DoubleColon
 
--- tick :: TokenParser Unit
--- tick = match Tick
+equals :: TokenParser Unit
+equals = match Equals
 
--- dot :: TokenParser Unit
--- dot = match Dot
+pipe :: TokenParser Unit
+pipe = match Pipe
 
--- comma :: TokenParser Unit
--- comma = match Comma
+tick :: TokenParser Unit
+tick = match Tick
 
--- semi :: TokenParser Unit
--- semi = match Semi
+dot :: TokenParser Unit
+dot = match Dot
 
--- at :: TokenParser Unit
--- at = match At
+comma :: TokenParser Unit
+comma = match Comma
 
--- underscore :: TokenParser Unit
--- underscore = match Underscore
+semi :: TokenParser Unit
+semi = match Semi
 
--- -- |
--- -- Parse zero or more values separated by semicolons
--- --
--- semiSep :: TokenParser a -> TokenParser [a]
--- semiSep = flip P.sepBy semi
+at :: TokenParser Unit
+at = match At
 
--- -- |
--- -- Parse one or more values separated by semicolons
--- --
--- semiSep1 :: TokenParser a -> TokenParser [a]
--- semiSep1 = flip P.sepBy1 semi
+underscore :: TokenParser Unit
+underscore = match Underscore
 
--- -- |
--- -- Parse zero or more values separated by commas
--- --
--- commaSep :: TokenParser a -> TokenParser [a]
--- commaSep = flip P.sepBy comma
+-- |
+-- Parse zero or more values separated by semicolons
+--
+semiSep :: forall a . TokenParser a -> TokenParser (List.List a)
+semiSep = flip P.sepBy semi
 
--- -- |
--- -- Parse one or more values separated by commas
--- --
--- commaSep1 :: TokenParser a -> TokenParser [a]
--- commaSep1 = flip P.sepBy1 comma
+-- |
+-- Parse one or more values separated by semicolons
+--
+semiSep1 :: forall a . TokenParser a -> TokenParser (List.List a)
+semiSep1 = flip P.sepBy1 semi
 
--- lname :: TokenParser String
--- lname = token go P.<?> "identifier"
---   where
---   go (LName s) = Just s
---   go _ = Nothing
+-- |
+-- Parse zero or more values separated by commas
+--
+commaSep :: forall a . TokenParser a -> TokenParser (List.List a)
+commaSep = flip P.sepBy comma
 
--- qualifier :: TokenParser String
--- qualifier = token go P.<?> "qualifier"
---   where
---   go (Qualifier s) = Just s
---   go _ = Nothing
+-- |
+-- Parse one or more values separated by commas
+--
+commaSep1 :: forall a . TokenParser a -> TokenParser (List.List a)
+commaSep1 = flip P.sepBy1 comma
 
--- reserved :: String -> TokenParser Unit
--- reserved s = token go P.<?> show s
---   where
---   go (LName s') | s == s' = Just unit
---   go _ = Nothing
+lname :: TokenParser String
+lname = token go P.<?> "identifier"
+  where
+  go (LName s) = Just s
+  go _ = Nothing
 
--- uname :: TokenParser String
--- uname = token go P.<?> "proper name"
---   where
---   go (UName s) = Just s
---   go _ = Nothing
+qualifier :: TokenParser String
+qualifier = token go P.<?> "qualifier"
+  where
+  go (Qualifier s) = Just s
+  go _ = Nothing
 
--- mname :: TokenParser String
--- mname = token go P.<?> "module name"
---   where
---   go (UName s) | validModuleName s = Just s
---   go _ = Nothing
+reserved :: String -> TokenParser Unit
+reserved s = token go P.<?> show s
+  where
+  go (LName s') | s == s' = Just unit
+  go _ = Nothing
 
--- uname' :: String -> TokenParser Unit
--- uname' s = token go P.<?> show s
---   where
---   go (UName s') | s == s' = Just unit
---   go _ = Nothing
+uname :: TokenParser String
+uname = token go P.<?> "proper name"
+  where
+  go (UName s) = Just s
+  go _ = Nothing
 
--- symbol :: TokenParser String
--- symbol = token go P.<?> "symbol"
---   where
---   go (Symbol s) = Just s
---   go Colon      = Just ":"
---   go LFatArrow  = Just "<="
---   go At         = Just "@"
---   go _ = Nothing
+mname :: TokenParser String
+mname = token go P.<?> "module name"
+  where
+  go (UName s) | validModuleName s = Just s
+  go _ = Nothing
 
--- symbol' :: String -> TokenParser Unit
--- symbol' s = token go P.<?> show s
---   where
---   go (Symbol s') | s == s'   = Just unit
---   go Colon       | s == ":"  = Just unit
---   go LFatArrow   | s == "<=" = Just unit
---   go _ = Nothing
+uname' :: String -> TokenParser Unit
+uname' s = token go P.<?> show s
+  where
+  go (UName s') | s == s' = Just unit
+  go _ = Nothing
 
--- charLiteral :: TokenParser Char
--- charLiteral = token go P.<?> "char literal"
---   where
---   go (CharLiteral c) = Just c
---   go _ = Nothing
+symbol :: TokenParser String
+symbol = token go P.<?> "symbol"
+  where
+  go (Symbol s) = Just s
+  go Colon      = Just ":"
+  go LFatArrow  = Just "<="
+  go At         = Just "@"
+  go _ = Nothing
 
--- stringLiteral :: TokenParser String
--- stringLiteral = token go P.<?> "string literal"
---   where
---   go (StringLiteral s) = Just s
---   go _ = Nothing
+symbol' :: String -> TokenParser Unit
+symbol' s = token go P.<?> show s
+  where
+  go (Symbol s') | s == s'   = Just unit
+  go Colon       | s == ":"  = Just unit
+  go LFatArrow   | s == "<=" = Just unit
+  go _ = Nothing
 
--- number :: TokenParser (Either Integer Double)
--- number = token go P.<?> "number"
---   where
---   go (NumberToken n) = Just n
---   go _ = Nothing
+charLiteral :: TokenParser Char
+charLiteral = token go P.<?> "char literal"
+  where
+  go (CharLiteral c) = Just c
+  go _ = Nothing
 
--- natural :: TokenParser Integer
--- natural = token go P.<?> "natural"
---   where
---   go (NumberToken (Left n)) = Just n
---   go _ = Nothing
+stringLiteral :: TokenParser String
+stringLiteral = token go P.<?> "string literal"
+  where
+  go (StringLiteral s) = Just s
+  go _ = Nothing
 
--- identifier :: TokenParser String
--- identifier = token go P.<?> "identifier"
---   where
---   go (LName s) | s `notElem` reservedPsNames = Just s
---   go _ = Nothing
+number :: TokenParser (Either Int Number)
+number = token go P.<?> "number"
+  where
+  go (NumberToken n) = Just n
+  go _ = Nothing
+
+natural :: TokenParser Int
+natural = token go P.<?> "natural"
+  where
+  go (NumberToken (Left n)) = Just n
+  go _ = Nothing
+
+identifier :: TokenParser String
+identifier = token go P.<?> "identifier"
+  where
+  go (LName s) | s `notElem` reservedPsNames = Just s
+  go _ = Nothing
 
 validModuleName :: String -> Boolean
 validModuleName s = not $ "_" `contains` s
