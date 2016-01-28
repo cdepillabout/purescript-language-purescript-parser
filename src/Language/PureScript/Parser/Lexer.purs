@@ -6,6 +6,7 @@ import Prelude
 import Control.Alt
 import Control.Apply
 import Control.MonadPlus
+import Control.Monad.State
 import Control.Plus
 import Data.Array as Array
 import Data.Char.Unicode
@@ -235,6 +236,9 @@ newtype ParseStateWrapper = ParseStateWrapper { parseState :: ParseState
                                               , tokens :: List.List PositionedToken
                                               }
 
+unParseStateWrapper :: ParseStateWrapper -> { parseState :: ParseState, tokens :: List.List PositionedToken }
+unParseStateWrapper (ParseStateWrapper p) = p
+
 type TokenParser a = P.Parser ParseStateWrapper a
 
 anyToken :: TokenParser PositionedToken
@@ -294,7 +298,7 @@ indent = token go P.<?> "indentation"
   go (Indent n) = Just n
   go _ = Nothing
 
-indentAt :: Int -> TokenParser Unit
+indentAt :: Column -> TokenParser Unit
 indentAt n = token go P.<?> "indentation at level " <> show n
   where
   go (Indent n') | n == n' = Just unit
@@ -505,3 +509,15 @@ isSymbolChar c =
 getPosition :: forall s m . (Applicative m) => P.ParserT s m P.Position
 getPosition = P.ParserT \(P.PState { input: s, position: pos }) ->
     pure { input: s, result: Right pos, consumed: false, position: pos }
+
+getState :: forall m . TokenParser ParseState
+getState = _.parseState <<< unParseStateWrapper <$> get
+
+updateIndentationLevel :: Int -> TokenParser Unit
+updateIndentationLevel level = modify go
+  where
+    go :: ParseStateWrapper -> ParseStateWrapper
+    go (ParseStateWrapper { parseState: (ParseState parseState), tokens: tokens}) =
+        ParseStateWrapper { parseState: (ParseState { indentationLevel: level })
+                          , tokens: tokens
+                          }

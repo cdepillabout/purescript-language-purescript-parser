@@ -11,3 +11,9 @@ newtype ParseState = ParseState {
     indentationLevel :: Column
   }
 -- deriving Show
+
+unParseState :: ParseState -> { indentationLevel :: Column }
+unParseState (ParseState p) = p
+
+initialParseState :: ParseState
+initialParseState = ParseState { indentationLevel: 0 }
